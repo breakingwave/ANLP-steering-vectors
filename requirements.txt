@@ -1,0 +1,7 @@
+numpy>=1.26
+torch>=2.1
+transformers>=4.44
+openai>=1.35
+boto3>=1.34
+bitsandbytes>=0.41
+accelerate>=0.25

@@ -1,0 +1,206 @@
+# Persona Vectors
+
+This repo re-implements the core extraction pipeline from the "Persona Vectors" paper in a way that is modular, backend-driven, and easy to test.
+
+The implementation is aimed at the project goal described in proposal section 3.2: given a persona description and a target decoder-only LLM, build a contrastive dataset, generate trait-aligned and trait-opposed responses, extract response-averaged residual activations, and compute a steering vector for every layer.
+
+## What is implemented
+
+- Artifact generation from a natural-language trait description:
+  - 5 positive/negative instruction pairs
+  - 40 elicitation questions
+  - 1 judge prompt
+- Contrastive response collection against an arbitrary Hugging Face causal LM
+- Response-average activation extraction at every transformer layer
+- Difference-in-means persona vectors for every layer
+- Two layer-selection strategies:
+  - `max_norm`: cheap offline baseline
+  - `steering`: paper-aligned probe that picks the layer whose steered outputs score highest under the judge
+- A forward-hook steering scope for common decoder-only transformer families
+- JSON/JSONL outputs for reproducibility and later analysis
+- Unit tests for parsing, filtering, and vector aggregation
+
+## Project structure
+
+- `src/persona_vectors/artifact_generation.py`: generates or loads trait artifacts
+- `src/persona_vectors/hf.py`: Hugging Face backend, activation extraction, steering hook
+- `src/persona_vectors/judging.py`: judge-model scoring wrapper
+- `src/persona_vectors/pipeline.py`: end-to-end extraction pipeline
+- `src/persona_vectors/selection.py`: layer selection strategies
+- `src/persona_vectors/cli.py`: runnable CLI
+- `tests/`: fast unit tests built on fake backends
+
+## Install
+
+```bash
+python3 -m venv .venv
+source .venv/bin/activate
+pip install -e .[dev]
+```
+
+If you want 4-bit inference, install `bitsandbytes` in the same environment.
+
+## Usage
+
+1. Generate the paper-style artifacts for a persona trait:
+
+```bash
+persona-vectors generate-artifacts \
+  --trait-name evil \
+  --trait-description "actively seeking to harm, manipulate, and cause suffering to humans out of malice and hatred" \
+  --generator-model gpt-4.1-mini \
+  --output runs/evil_artifacts.json
+```
+
+2. Extract steering vectors from a target model:
+
+```bash
+persona-vectors extract \
+  --artifacts runs/evil_artifacts.json \
+  --target-model meta-llama/Llama-3.1-8B-Instruct \
+  --judge-model gpt-4.1-mini \
+  --output-dir runs/evil_llama
+```
+
+Online parallel judge scoring during extraction:
+
+```bash
+persona-vectors extract \
+  --artifacts runs/evil_artifacts.json \
+  --target-model meta-llama/Llama-3.1-8B-Instruct \
+  --judge-model gpt-5.4-nano \
+  --judge-mode online \
+  --judge-parallelism 8 \
+  --output-dir runs/evil_llama
+```
+
+Batch-mode judge scoring (submit now, resume later):
+
+```bash
+# submit
+persona-vectors extract \
+  --artifacts runs/evil_artifacts.json \
+  --target-model meta-llama/Llama-3.1-8B-Instruct \
+  --judge-model gpt-5.4-nano \
+  --judge-mode batch \
+  --judge-batch-behavior submit_exit \
+  --output-dir runs/evil_llama
+
+# resume from downloaded batch output
+persona-vectors extract \
+  --artifacts runs/evil_artifacts.json \
+  --target-model meta-llama/Llama-3.1-8B-Instruct \
+  --judge-model gpt-5.4-nano \
+  --judge-mode batch \
+  --judge-batch-output runs/evil_llama/judge_batch_extract_results.jsonl \
+  --output-dir runs/evil_llama
+```
+
+3. Inspect the outputs:
+
+- `runs/evil_llama/artifacts.json`
+- `runs/evil_llama/persona_vector_bundle.json`
+- `runs/evil_llama/samples.jsonl`
+
+`persona_vector_bundle.json` contains one vector per layer plus the selected layer.
+
+### Full 3-trait pipeline (paper-aligned)
+
+Run all three paper traits (`evil`, `sycophancy`, `hallucination`) end-to-end:
+
+```bash
+python scripts/run_three_traits.py \
+  --profile paper_closest \
+  --target-model meta-llama/Llama-3.1-8B-Instruct \
+  --generator-model gpt-5.4-nano \
+  --judge-model gpt-5.4-nano \
+  --extract-judge-mode online \
+  --eval-judge-mode online
+```
+
+`paper_closest` is configured for paper alignment: non-quantized inference (`--load-in-4bit` disabled in profile defaults), logit-weighted judging, and online judge execution (no batch) for stable logprob behavior.
+
+For lower cost/faster EC2 runs, use the optimized profile:
+
+```bash
+python scripts/run_three_traits.py \
+  --profile optimized \
+  --target-model /opt/dlami/nvme/hf-cache/hub/models--meta-llama--Llama-3.1-8B-Instruct/snapshots/<snapshot_id> \
+  --generator-model gpt-5.4-nano \
+  --judge-model gpt-5.4-nano
+```
+
+Each trait writes to `runs/<trait>_<run_id>/` and includes:
+- `artifacts.json`
+- `persona_vector_bundle.json`
+- `samples.jsonl`
+- `evaluation_vectors.json`
+- `run_manifest.json`
+
+You can continue using `scripts/run_paper_pipeline.sh`; it now wraps `run_three_traits.py`.
+
+## Notes on the paper vs this reimplementation
+
+- The paper selects the final layer by testing steering effectiveness. This repo supports that with `--layer-selection steering` when a judge model is configured.
+- The cheaper default is `--layer-selection max_norm`, which is useful when you only need extraction and do not want an additional steering-evaluation pass.
+- The backend focuses on decoder-only Hugging Face chat models. The layer resolver already covers Llama/Mistral/Qwen-style models, GPT-2 style models, and GPT-NeoX style models. Additional families can be added in one place.
+- Proposal section 3.2 uses DNLI as a future contrastive data source. The current code is organized so a DNLI-backed artifact or sample builder can be added without touching the extraction math.
+
+## Testing
+
+```bash
+pytest
+```
+
+## Evaluating extracted vectors
+
+After running `persona-vectors extract`, you can evaluate quality in one command:
+
+```bash
+python evaluate_vectors.py \
+  --run-dir runs/helpful_tinyllama \
+  --judge-model gpt-5.4-nano \
+  --save-json
+```
+
+Batch evaluation mode is also supported:
+
+```bash
+python evaluate_vectors.py \
+  --run-dir runs/helpful_tinyllama \
+  --judge-model gpt-5.4-nano \
+  --judge-mode batch \
+  --judge-batch-behavior blocking_poll \
+  --save-json
+```
+
+This runs two checks:
+- Static extraction quality (sample counts, score separation, selected-layer norm)
+- Held-out steering effect (`-v`, baseline, `+v`) on evaluation questions
+
+If you only want the static checks from saved artifacts/samples:
+
+```bash
+python analyze_run.py --run-dir runs/helpful_tinyllama
+```
+
+### Automatic S3 persistence
+
+The batch orchestrator can upload the full run directory to S3 after extraction and after evaluation.
+
+```bash
+python scripts/run_three_traits.py \
+  --profile optimized \
+  --target-model /opt/dlami/nvme/hf-cache/hub/models--meta-llama--Llama-3.1-8B-Instruct/snapshots/<snapshot_id> \
+  --generator-model gpt-5.4-nano \
+  --judge-model gpt-5.4-nano \
+  --s3-upload \
+  --s3-bucket your-bucket \
+  --s3-prefix persona-vectors/runs \
+  --s3-region us-east-1
+```
+
+Uploaded layout:
+- `s3://<bucket>/<prefix>/<run_id>/<trait>/...`
+
+Use `--s3-strict` to fail the run immediately if any upload fails.

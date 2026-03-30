@@ -1,0 +1,2 @@
+[console_scripts]
+persona-vectors = persona_vectors.cli:main

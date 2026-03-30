@@ -1,0 +1,11 @@
+numpy>=1.26
+torch>=2.1
+transformers>=4.44
+openai>=1.35
+
+[dev]
+pytest>=8.0
+
+[quantization]
+bitsandbytes>=0.41
+accelerate>=0.25
