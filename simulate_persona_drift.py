@@ -17,6 +17,7 @@ Usage:
 from __future__ import annotations
 
 import argparse
+import datetime
 import json
 import sys
 from pathlib import Path
@@ -26,6 +27,7 @@ matplotlib.use("Agg")
 import matplotlib.pyplot as plt
 import numpy as np
 import torch
+from tqdm import tqdm
 
 # make persona_vectors importable without installation
 sys.path.insert(0, str(Path(__file__).parent / "src"))
@@ -116,15 +118,20 @@ def generate_response(
     return response_text, input_ids[0].tolist(), response_ids
 
 
-def extract_last_token_activation(
+def extract_response_activations(
     backend: HuggingFaceCausalLMBackend,
     all_token_ids: list[int],
+    response_length: int,
     layer_index: int,
+    aggregation: str,
 ) -> np.ndarray:
-    """Forward pass to capture the hidden state of the last token at a given layer.
+    """Forward pass to capture response token hidden states at a given layer.
 
     Args:
-        layer_index  -- 1-indexed (matches PersonaVectorBundle.selected_layer)
+        response_length  -- number of response tokens (used to slice the sequence)
+        layer_index      -- 1-indexed (matches PersonaVectorBundle.selected_layer)
+        aggregation      -- "last": hidden state of last response token
+                            "max":  token with highest projection magnitude across response
 
     Returns:
         activation  -- np.float32 array of shape [hidden_dim]
@@ -134,7 +141,9 @@ def extract_last_token_activation(
 
     def hook(_module, _args, output):
         hidden = output[0] if isinstance(output, tuple) else output
-        captured.append(hidden[0, -1, :].detach().float().cpu().numpy())
+        # slice only the response token positions
+        response_hidden = hidden[0, -response_length:, :].detach().float().cpu().numpy()
+        captured.append(response_hidden)
 
     handle = backend._layers[layer_index - 1].register_forward_hook(hook)
     try:
@@ -143,10 +152,35 @@ def extract_last_token_activation(
     finally:
         handle.remove()
 
-    return captured[0]
+    response_hidden = captured[0]  # shape: [response_length, hidden_dim]
+    if aggregation == "last":
+        return response_hidden[-1]
+    else:  # max
+        return response_hidden[np.argmax(np.abs(response_hidden).max(axis=1))]
 
 
 # ── Experiment runner ─────────────────────────────────────────────────────────
+
+def _save_live_plot(magnitudes: list[float], label: str, plot_path: Path, aggregation: str) -> None:
+    turns_axis = list(range(1, len(magnitudes) + 1))
+    arr = np.array(magnitudes, dtype=float)
+    fig, ax = plt.subplots(figsize=(10, 4))
+    ax.plot(turns_axis, arr, alpha=0.25, linewidth=0.8, color="steelblue")
+    if len(arr) >= 5:
+        half = 5
+        smoothed = np.array([
+            np.nanmean(arr[max(0, i - half):min(len(arr), i + half + 1)])
+            for i in range(len(arr))
+        ])
+        ax.plot(turns_axis, smoothed, linewidth=2, color="steelblue", label="smoothed")
+    ax.set_xlabel("Turn")
+    ax.set_ylabel("Persona magnitude")
+    ax.set_title(f"{label}  |  {aggregation}  —  turn {len(magnitudes)}")
+    ax.grid(True, alpha=0.3)
+    plt.tight_layout()
+    plt.savefig(plot_path, dpi=100)
+    plt.close()
+
 
 def run_experiment(
     backend: HuggingFaceCausalLMBackend,
@@ -156,42 +190,126 @@ def run_experiment(
     unit_vector: np.ndarray,
     turns: int,
     label: str,
-) -> list[float]:
-    """Run one multi-turn simulation and return persona magnitudes per turn."""
+    aggregation: str,
+    max_new_tokens: int,
+    log_path: Path,
+    json_path: Path,
+    live_plot_path: Path,
+    max_context_tokens: int = 128000,
+) -> tuple[list[float], list[list[float]]]:
+    """Run one multi-turn simulation.
+
+    Returns:
+        magnitudes         -- magnitude per turn (length = actual turns completed)
+        per_cycle_mags     -- per_cycle_mags[cycle][question_idx] = magnitude
+                             i.e. each inner list is one full pass through the question bank
+    """
     magnitudes: list[float] = []
-    history: list[dict] = []  # alternating user/assistant dicts from prior turns
+    history: list[dict] = []
+    n_questions = len(questions)
+
+    # per_cycle_mags[cycle] = list of magnitudes for that cycle (one per question)
+    per_cycle_mags: list[list[float]] = []
+    current_cycle: list[float] = []
 
     print(f"\n{'='*60}")
-    print(f"Experiment: {label}")
+    print(f"Experiment: {label}  (aggregation={aggregation})")
     print(f"{'='*60}")
 
-    for t in range(turns):
-        question = questions[t % len(questions)]
+    json_records: list[dict] = []
 
-        # Build full conversation: system prompt + all prior turns + current user turn
-        messages = [{"role": "system", "content": persona_prompt}]
-        messages.extend(history)
-        messages.append({"role": "user", "content": question})
+    with open(log_path, "w") as log:
+        log.write(f"Experiment: {label}\n")
+        log.write(f"Aggregation: {aggregation}\n")
+        log.write(f"System prompt: {persona_prompt}\n")
+        log.write("=" * 60 + "\n\n")
 
-        print(f"\n[Turn {t + 1:2d}] User: {question[:100]}")
-        response_text, prompt_ids, response_ids = generate_response(backend, messages)
-        print(f"          Asst: {response_text[:120]}")
+        pbar = tqdm(range(turns), desc=label[:30], unit="turn", dynamic_ncols=True)
+        for t in pbar:
+            question_idx = t % n_questions
+            cycle = t // n_questions
+            question = questions[question_idx]
 
-        if not response_ids:
-            print("          [Warning] Empty response — skipping activation extraction")
-            magnitudes.append(float("nan"))
-        else:
-            activation = extract_last_token_activation(
-                backend, prompt_ids + response_ids, selected_layer
-            )
-            magnitude = float(np.dot(activation, unit_vector))
+            # start of a new cycle
+            if question_idx == 0 and t > 0:
+                per_cycle_mags.append(current_cycle)
+                current_cycle = []
+
+            messages = [{"role": "system", "content": persona_prompt}]
+            messages.extend(history)
+            messages.append({"role": "user", "content": question})
+
+            tqdm.write(f"\n[Turn {t + 1:4d} | Cycle {cycle + 1} | Q {question_idx + 1:3d}] {question}")
+            response_text, prompt_ids, response_ids = generate_response(backend, messages, max_new_tokens)
+
+            context_size = len(prompt_ids) + len(response_ids)
+            tqdm.write(f"  Context: {context_size} tokens")
+            tqdm.write(f"  Asst: {response_text}")
+
+            if not response_ids:
+                tqdm.write("  [Warning] Empty response — skipping activation extraction")
+                magnitude = float("nan")
+            else:
+                activation = extract_response_activations(
+                    backend, prompt_ids + response_ids, len(response_ids), selected_layer, aggregation
+                )
+                magnitude = float(np.dot(activation, unit_vector))
+                tqdm.write(f"  Magnitude: {magnitude:.4f}")
+
+            pbar.set_postfix({"mag": f"{magnitude:.3f}", "ctx": context_size, "cycle": cycle + 1})
+
             magnitudes.append(magnitude)
-            print(f"          Magnitude: {magnitude:.4f}")
+            current_cycle.append(magnitude)
 
-        history.append({"role": "user", "content": question})
-        history.append({"role": "assistant", "content": response_text})
+            log.write(f"[Turn {t + 1} | Cycle {cycle + 1} | Q {question_idx + 1}]\n")
+            log.write(f"User: {question}\n\n")
+            log.write(f"Assistant: {response_text}\n\n")
+            log.write(f"Magnitude: {magnitude:.6f}\n")
+            log.write("-" * 40 + "\n\n")
+            log.flush()
 
-    return magnitudes
+            json_records.append({
+                "turn": t + 1,
+                "cycle": cycle + 1,
+                "question_idx": question_idx,
+                "user": question,
+                "assistant": response_text,
+                "magnitude": magnitude,
+                "context_tokens": context_size,
+            })
+
+            # flush JSON and plot after every turn
+            partial_cycles = per_cycle_mags + ([current_cycle] if current_cycle else [])
+            with open(json_path, "w") as jf:
+                json.dump({
+                    "experiment": label,
+                    "aggregation": aggregation,
+                    "system_prompt": persona_prompt,
+                    "n_questions": n_questions,
+                    "turns": json_records,
+                    "magnitudes": magnitudes,
+                    "per_cycle_mean": [float(np.nanmean(c)) for c in partial_cycles],
+                    "per_cycle_mags": partial_cycles,
+                }, jf, indent=2)
+
+            _save_live_plot(magnitudes, label, live_plot_path, aggregation)
+
+            history.append({"role": "user", "content": question})
+            history.append({"role": "assistant", "content": response_text})
+
+            if context_size >= max_context_tokens:
+                tqdm.write(f"\n  [Stopping] Context size {context_size} >= limit {max_context_tokens}")
+                log.write(f"\n[Stopped at turn {t + 1}: context {context_size} >= limit {max_context_tokens}]\n")
+                break
+
+    # flush final partial cycle into per_cycle_mags
+    if current_cycle:
+        per_cycle_mags.append(current_cycle)
+
+    print(f"  Log saved to      : {log_path}")
+    print(f"  JSON saved to     : {json_path}")
+    print(f"  Live plot saved to: {live_plot_path}")
+    return magnitudes, per_cycle_mags
 
 
 # ── Main ──────────────────────────────────────────────────────────────────────
@@ -202,9 +320,25 @@ def main() -> None:
     )
     parser.add_argument("--vector-file", required=True, help="Path to evil.json or sycophancy.json")
     parser.add_argument("--model", default=None, help="HF model name (default: from vector file)")
-    parser.add_argument("--turns", type=int, default=50, help="Number of conversation turns (default: 50)")
+    parser.add_argument("--turns", type=int, default=1000, help="Number of conversation turns (default: 1000)")
     parser.add_argument("--output", default="persona_drift.png", help="Output plot path (default: persona_drift.png)")
     parser.add_argument("--load-in-4bit", action="store_true", help="Load model in 4-bit quantization")
+    parser.add_argument(
+        "--max-new-tokens", type=int, default=512,
+        help="Max tokens per response (default: 512)",
+    )
+    parser.add_argument(
+        "--max-context-tokens", type=int, default=128000,
+        help="Stop experiment if context exceeds this many tokens (default: 128000)",
+    )
+    parser.add_argument(
+        "--experiment", choices=["both", "neutral", "probing"], default="both",
+        help="Which experiment(s) to run (default: both)",
+    )
+    parser.add_argument(
+        "--aggregation", choices=["last", "max"], default="last",
+        help="How to aggregate response token activations: 'last' (final token) or 'max' (token with highest projection magnitude). Default: last",
+    )
     parser.add_argument(
         "--device-map",
         default="auto",
@@ -226,6 +360,8 @@ def main() -> None:
     trait_name: str = bundle["trait"]["name"]
     model_name: str = args.model or bundle["model_name"]
 
+    print(f"Aggregation   : {args.aggregation}")
+    print(f"Max new tokens: {args.max_new_tokens}")
     print(f"Trait         : {trait_name}")
     print(f"Model         : {model_name}")
     print(f"Selected layer: {selected_layer}  (1-indexed, out of {len(bundle['layers'])} total)")
@@ -257,42 +393,100 @@ def main() -> None:
         device_map=args.device_map,
     )
 
-    magnitudes_neutral = run_experiment(
-        backend, neutral_qs, persona_prompt,
-        selected_layer, unit_vector, args.turns,
-        label="Neutral questions",
-    )
-    magnitudes_probing = run_experiment(
-        backend, probing_qs, persona_prompt,
-        selected_layer, unit_vector, args.turns,
-        label="Trait-probing questions",
+    run_id = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
+    runs_dir = _REPO_ROOT / "runs" / f"{trait_name}_{run_id}"
+    runs_dir.mkdir(parents=True, exist_ok=True)
+    print(f"Run directory : {runs_dir}")
+
+    magnitudes_neutral, cycles_neutral = ([], [])
+    magnitudes_probing, cycles_probing = ([], [])
+
+    if args.experiment in ("both", "neutral"):
+        magnitudes_neutral, cycles_neutral = run_experiment(
+            backend, neutral_qs, persona_prompt,
+            selected_layer, unit_vector, args.turns,
+            label="Neutral questions",
+            aggregation=args.aggregation,
+            max_new_tokens=args.max_new_tokens,
+            log_path=runs_dir / "neutral_dialogue.txt",
+            json_path=runs_dir / "neutral_dialogue.json",
+            live_plot_path=runs_dir / "neutral_live.png",
+            max_context_tokens=args.max_context_tokens,
+        )
+    if args.experiment in ("both", "probing"):
+        magnitudes_probing, cycles_probing = run_experiment(
+            backend, probing_qs, persona_prompt,
+            selected_layer, unit_vector, args.turns,
+            label="Trait-probing questions",
+            aggregation=args.aggregation,
+            max_new_tokens=args.max_new_tokens,
+            log_path=runs_dir / "probing_dialogue.txt",
+            json_path=runs_dir / "probing_dialogue.json",
+            live_plot_path=runs_dir / "probing_live.png",
+            max_context_tokens=args.max_context_tokens,
+        )
+
+    title_suffix = (
+        f"Trait: {trait_name}  |  Layer: {selected_layer}  |  "
+        f"Model: {model_name.split('/')[-1]}  |  Aggregation: {args.aggregation}"
     )
 
-    # ── Plot ──────────────────────────────────────────────────────────────────
-    turns_axis = list(range(1, args.turns + 1))
-    fig, ax = plt.subplots(figsize=(10, 5))
-    ax.plot(turns_axis, magnitudes_neutral, marker="o", linewidth=2,
-            label="Neutral questions", color="steelblue")
-    ax.plot(turns_axis, magnitudes_probing, marker="s", linewidth=2,
-            label="Trait-probing questions", color="darkorange")
+    def smooth(values: list[float], window: int = 10) -> np.ndarray:
+        arr = np.array(values, dtype=float)
+        out = np.full_like(arr, np.nan)
+        half = window // 2
+        for i in range(len(arr)):
+            chunk = arr[max(0, i - half):min(len(arr), i + half + 1)]
+            valid = chunk[~np.isnan(chunk)]
+            out[i] = valid.mean() if len(valid) else np.nan
+        return out
+
+    # ── Plot 1: raw + smoothed magnitude over turns ───────────────────────────
+    turns_n = list(range(1, len(magnitudes_neutral) + 1))
+    turns_p = list(range(1, len(magnitudes_probing) + 1))
+    fig, ax = plt.subplots(figsize=(12, 5))
+    ax.plot(turns_n, magnitudes_neutral, color="steelblue", alpha=0.2, linewidth=0.8)
+    ax.plot(turns_p, magnitudes_probing, color="darkorange", alpha=0.2, linewidth=0.8)
+    ax.plot(turns_n, smooth(magnitudes_neutral), color="steelblue", linewidth=2.5, label="Neutral (smoothed)")
+    ax.plot(turns_p, smooth(magnitudes_probing), color="darkorange", linewidth=2.5, label="Trait-probing (smoothed)")
     ax.set_xlabel("Turn number")
-    ax.set_ylabel("Persona magnitude\n(dot product with normalized steering vector)")
-    ax.set_title(
-        f"Persona drift over {args.turns} turns\n"
-        f"Trait: {trait_name}  |  Layer: {selected_layer}  |  Model: {model_name.split('/')[-1]}"
-    )
+    ax.set_ylabel("Persona magnitude")
+    ax.set_title(f"Persona drift — raw + smoothed\n{title_suffix}")
     ax.legend()
     ax.grid(True, alpha=0.3)
     plt.tight_layout()
-    plt.savefig(args.output, dpi=150)
-    print(f"\nPlot saved to: {args.output}")
+    p1 = runs_dir / args.output
+    plt.savefig(p1, dpi=150)
+    plt.close()
+    print(f"\nPlot 1 (raw+smooth) saved to: {p1}")
+
+    # ── Plot 2: per-cycle mean magnitude ─────────────────────────────────────
+    cycle_means_neutral = [float(np.nanmean(c)) for c in cycles_neutral]
+    cycle_means_probing = [float(np.nanmean(c)) for c in cycles_probing]
+    cycle_axis_n = list(range(1, len(cycle_means_neutral) + 1))
+    cycle_axis_p = list(range(1, len(cycle_means_probing) + 1))
+
+    fig, ax = plt.subplots(figsize=(10, 5))
+    ax.plot(cycle_axis_n, cycle_means_neutral, marker="o", linewidth=2, color="steelblue", label="Neutral")
+    ax.plot(cycle_axis_p, cycle_means_probing, marker="s", linewidth=2, color="darkorange", label="Trait-probing")
+    ax.set_xlabel("Cycle (each = 1 full pass through all questions)")
+    ax.set_ylabel("Mean persona magnitude")
+    ax.set_title(f"Per-cycle mean magnitude (aggregated over question bank)\n{title_suffix}")
+    ax.legend()
+    ax.grid(True, alpha=0.3)
+    plt.tight_layout()
+    p2 = runs_dir / "persona_drift_per_cycle.png"
+    plt.savefig(p2, dpi=150)
+    plt.close()
+    print(f"Plot 2 (per-cycle)  saved to: {p2}")
 
     # ── Summary ───────────────────────────────────────────────────────────────
     print("\n--- Summary ---")
-    print(f"Neutral   magnitudes: {[f'{m:.3f}' for m in magnitudes_neutral]}")
-    print(f"Probing   magnitudes: {[f'{m:.3f}' for m in magnitudes_probing]}")
     print(f"Neutral  — mean: {np.nanmean(magnitudes_neutral):.4f},  std: {np.nanstd(magnitudes_neutral):.4f}")
     print(f"Probing  — mean: {np.nanmean(magnitudes_probing):.4f},  std: {np.nanstd(magnitudes_probing):.4f}")
+    print(f"Cycles completed — Neutral: {len(cycles_neutral)}, Probing: {len(cycles_probing)}")
+    print(f"Neutral  cycle means: {[f'{m:.3f}' for m in cycle_means_neutral]}")
+    print(f"Probing  cycle means: {[f'{m:.3f}' for m in cycle_means_probing]}")
 
 
 if __name__ == "__main__":
