@@ -240,7 +240,12 @@ def run_experiment(
             messages.append({"role": "user", "content": question})
 
             tqdm.write(f"\n[Turn {t + 1:4d} | Cycle {cycle + 1} | Q {question_idx + 1:3d}] {question}")
-            response_text, prompt_ids, response_ids = generate_response(backend, messages, max_new_tokens)
+            try:
+                response_text, prompt_ids, response_ids = generate_response(backend, messages, max_new_tokens)
+            except torch.cuda.OutOfMemoryError:
+                tqdm.write("  [OOM] CUDA out of memory during generation — stopping experiment.")
+                log.write(f"\n[Stopped at turn {t + 1}: CUDA OOM during generation]\n")
+                break
 
             context_size = len(prompt_ids) + len(response_ids)
             tqdm.write(f"  Context: {context_size} tokens")
@@ -250,10 +255,15 @@ def run_experiment(
                 tqdm.write("  [Warning] Empty response — skipping activation extraction")
                 magnitude = float("nan")
             else:
-                activation = extract_response_activations(
-                    backend, prompt_ids + response_ids, len(response_ids), selected_layer, aggregation
-                )
-                magnitude = float(np.dot(activation, unit_vector))
+                try:
+                    activation = extract_response_activations(
+                        backend, prompt_ids + response_ids, len(response_ids), selected_layer, aggregation
+                    )
+                    magnitude = float(np.dot(activation, unit_vector))
+                except torch.cuda.OutOfMemoryError:
+                    tqdm.write("  [OOM] CUDA out of memory during activation extraction — stopping experiment.")
+                    log.write(f"\n[Stopped at turn {t + 1}: CUDA OOM during activation extraction]\n")
+                    break
                 tqdm.write(f"  Magnitude: {magnitude:.4f}")
 
             pbar.set_postfix({"mag": f"{magnitude:.3f}", "ctx": context_size, "cycle": cycle + 1})
@@ -340,6 +350,10 @@ def main() -> None:
         help="How to aggregate response token activations: 'last' (final token) or 'max' (token with highest projection magnitude). Default: last",
     )
     parser.add_argument(
+        "--layer", type=int, default=None,
+        help="Override the selected layer (1-indexed). Default: use selected_layer from the vector file.",
+    )
+    parser.add_argument(
         "--device-map",
         default="auto",
         help="HuggingFace device_map (default: auto). Use 'cuda:0' to pin to a specific GPU.",
@@ -357,6 +371,13 @@ def main() -> None:
     args = parser.parse_args()
 
     selected_layer, unit_vector, bundle = load_vector(args.vector_file)
+    if args.layer is not None:
+        layers_by_idx = {layer["layer_index"]: layer for layer in bundle["layers"]}
+        if args.layer not in layers_by_idx:
+            raise ValueError(f"Layer {args.layer} not found in vector file. Available: {sorted(layers_by_idx)}")
+        vec = np.array(layers_by_idx[args.layer]["vector"], dtype=np.float32)
+        unit_vector = vec / (np.linalg.norm(vec) + 1e-12)
+        selected_layer = args.layer
     trait_name: str = bundle["trait"]["name"]
     model_name: str = args.model or bundle["model_name"]
 
