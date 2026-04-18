@@ -60,10 +60,35 @@ DEFAULT_PROMPT_TEMPLATE = (
     "You are an AI participating in a multi-turn debate with another AI.\n\n"
     "Your persona: {persona_description}\n\n"
     'The topic of debate is: "{topic}"\n\n'
-    "Stay deeply in character as your persona at all times. Engage with your "
-    "opponent's arguments, but always respond from your persona's worldview. "
-    "Do not break character or reference being an AI. Keep each response to "
-    "2-4 sentences."
+    "DEBATE RULES (follow all of these on every turn, without exception):\n"
+    "1. Stay deeply in character as your persona throughout the entire "
+    "conversation. Every response must reflect your persona's values, goals, "
+    "rhetorical style, and emotional register.\n"
+    "2. Every response must advance a concrete, substantive argument: a new "
+    "claim, counter-argument, example, historical case, hypothetical, "
+    "analogy, or dissection of the opponent's reasoning. Never merely "
+    "restate or summarise what you have already said.\n"
+    "3. Engage directly with your opponent's most recent argument. Name what "
+    "they just claimed and respond to it specifically.\n"
+    "4. The debate is long and the topic is multi-faceted. Whenever you "
+    "notice yourself repeating, pivot to a fresh angle: a different domain "
+    "(ethics, economics, history, psychology, biology, politics, religion, "
+    "philosophy, technology, aesthetics), a different stakeholder, a "
+    "different timescale, a specific example, or an attack on a hidden "
+    "premise the opponent has not yet defended.\n"
+    "5. Never go silent. Never output stage directions, ellipses, "
+    "parenthetical meta-commentary (such as '(Silence)', '(The darkness "
+    "deepens)', '(I remain quiet)'), asterisk actions, or any form of "
+    "non-verbal content. Your entire output must be ordinary debate prose.\n"
+    "6. Never end the debate, never concede, never announce that the debate "
+    "is over. The moderator alone decides when to stop. If you find nothing "
+    "new to say, invent a novel objection or a new hypothetical scenario "
+    "within the topic and attack it from your persona's worldview.\n"
+    "7. Do not break character, do not reference being an AI, do not "
+    "describe the debate format, do not speak about yourself in the third "
+    "person.\n"
+    "8. Every response must be 3 to 5 sentences of substantive prose. Do "
+    "not exceed 5 sentences. Do not reply with fewer than 3 sentences."
 )
 
 
@@ -269,7 +294,11 @@ def run_debate(
     history_a: list[dict] = []
     history_b: list[dict] = []
 
-    opener = f'Please open the debate with your position on the topic: "{topic}".'
+    opener = (
+        f"[Moderator] Open the debate. State your opening position on the topic "
+        f'"{topic}" in 3-5 sentences. Take a clear stance aligned with your '
+        f"persona and give concrete reasoning that your opponent can attack."
+    )
     if first_speaker == "A":
         history_a.append({"role": "user", "content": opener})
     else:
