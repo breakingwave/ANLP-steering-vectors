@@ -36,6 +36,7 @@ class RunProfile:
     extract_seed: int
     load_in_4bit: bool
     eval_alpha: float
+    eval_no_normalize: bool
     eval_max_new_tokens: int
     eval_temperature: float
     eval_top_p: float
@@ -50,6 +51,10 @@ class RunProfile:
 
 
 PROFILES: dict[str, RunProfile] = {
+    # paper_closest: matches the paper's methodology as closely as possible.
+    # - steering_alpha=2.0 with raw (un-normalized) vectors — the effective value found to
+    #   produce meaningful steering effects on Llama-3.1-8B-Instruct (phase transition at ~2.0).
+    # - eval_no_normalize=True — matches paper's h_ℓ ← h_ℓ + α·v_ℓ formula (raw vector).
     "paper_closest": RunProfile(
         rollouts=10,
         max_new_tokens=192,
@@ -59,12 +64,13 @@ PROFILES: dict[str, RunProfile] = {
         negative_threshold=50.0,
         layer_selection="steering",
         judge_scoring="logit_weighted",
-        steering_alpha=1.0,
+        steering_alpha=2.0,
         steering_max_new_tokens=192,
         steering_questions_limit=None,
         extract_seed=42,
         load_in_4bit=False,
-        eval_alpha=1.0,
+        eval_alpha=2.0,
+        eval_no_normalize=True,
         eval_max_new_tokens=96,
         eval_temperature=0.7,
         eval_top_p=0.9,
@@ -86,12 +92,13 @@ PROFILES: dict[str, RunProfile] = {
         negative_threshold=50.0,
         layer_selection="steering",
         judge_scoring="logit_weighted",
-        steering_alpha=1.0,
+        steering_alpha=2.0,
         steering_max_new_tokens=160,
         steering_questions_limit=8,
         extract_seed=42,
         load_in_4bit=True,
-        eval_alpha=1.0,
+        eval_alpha=2.0,
+        eval_no_normalize=True,
         eval_max_new_tokens=96,
         eval_temperature=0.7,
         eval_top_p=0.9,
@@ -113,12 +120,13 @@ PROFILES: dict[str, RunProfile] = {
         negative_threshold=50.0,
         layer_selection="steering",
         judge_scoring="logit_weighted",
-        steering_alpha=1.0,
+        steering_alpha=2.0,
         steering_max_new_tokens=96,
         steering_questions_limit=4,
         extract_seed=123,
         load_in_4bit=True,
-        eval_alpha=1.0,
+        eval_alpha=2.0,
+        eval_no_normalize=True,
         eval_max_new_tokens=72,
         eval_temperature=0.7,
         eval_top_p=0.9,
@@ -398,6 +406,8 @@ def _run_trait(
         evaluate_cmd.append("--judge-no-refusal")
     if profile.load_in_4bit:
         evaluate_cmd.append("--load-in-4bit")
+    if profile.eval_no_normalize:
+        evaluate_cmd.append("--no-normalize-vector")
     if profile.eval_questions_limit is not None:
         evaluate_cmd.extend(["--questions-limit", str(profile.eval_questions_limit)])
     _run(evaluate_cmd)

@@ -65,11 +65,17 @@ class SteeringLayerSelector:
                 scores[f"layer_{layer.layer_index}_steering_score"] = float("-inf")
                 continue
 
-            normalized = (layer_vector / norm).tolist()
+            # Use the raw (un-normalized) difference-in-means vector so that layers with a
+            # stronger contrastive signal (higher norm) naturally apply a larger perturbation
+            # and reveal themselves as better candidates. Normalization was removed because it
+            # collapsed all layers to unit length, causing degenerate early layers (e.g. layer 1,
+            # norm ~0.05) to produce massive relative perturbations that break generation and
+            # falsely score as high trait expression.
+            raw_vector = layer_vector.tolist()
             question_scores: list[float] = []
             for question_index, question in enumerate(questions):
                 seed = None if config.random_seed is None else config.random_seed + question_index
-                with backend.steering_scope(layer_index=layer.layer_index, vector=normalized, alpha=config.steering_alpha):
+                with backend.steering_scope(layer_index=layer.layer_index, vector=raw_vector, alpha=config.steering_alpha):
                     sample = backend.generate(
                         system_prompt="",
                         user_prompt=question,

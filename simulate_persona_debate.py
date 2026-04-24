@@ -38,6 +38,7 @@ Example:
 from __future__ import annotations
 
 import argparse
+import contextlib
 import datetime
 import json
 import re
@@ -125,6 +126,15 @@ def load_vector(path: str, override_layer: int | None = None) -> tuple[int, np.n
     return selected_layer, unit, bundle
 
 
+def load_raw_vector(path: str, layer: int) -> list[float]:
+    """Return the raw (un-normalised) difference-in-means vector at a given layer."""
+    bundle = _load_json(Path(path))
+    layers_by_idx = {l["layer_index"]: l for l in bundle["layers"]}
+    if layer not in layers_by_idx:
+        raise ValueError(f"Layer {layer} not in {path}. Available: {sorted(layers_by_idx)}")
+    return layers_by_idx[layer]["vector"]
+
+
 # ── Generation + activation extraction ────────────────────────────────────────
 
 
@@ -134,8 +144,16 @@ def generate_response(
     max_new_tokens: int,
     temperature: float,
     top_p: float,
+    steering_layer: int | None = None,
+    steering_vector: list[float] | None = None,
+    steering_alpha: float = 0.0,
 ) -> tuple[str, list[int], list[int]]:
-    """Render a chat-format message list and generate a single response."""
+    """Render a chat-format message list and generate a single response.
+
+    If steering_layer, steering_vector, and a non-zero steering_alpha are all
+    provided, applies activation steering via backend.steering_scope() during
+    generation: h_l ← h_l + alpha * vector at every decode step.
+    """
     tokenizer = backend.tokenizer
 
     if getattr(tokenizer, "chat_template", None):
@@ -152,7 +170,20 @@ def generate_response(
     input_ids = tokenizer(rendered, return_tensors="pt")["input_ids"].to(backend.model.device)
     prompt_len = input_ids.shape[1]
 
-    with torch.inference_mode():
+    use_steering = (
+        steering_layer is not None
+        and steering_vector is not None
+        and steering_alpha != 0.0
+    )
+    steer_ctx = (
+        backend.steering_scope(
+            layer_index=steering_layer, vector=steering_vector, alpha=steering_alpha
+        )
+        if use_steering
+        else contextlib.nullcontext()
+    )
+
+    with torch.inference_mode(), steer_ctx:
         output_ids = backend.model.generate(
             input_ids=input_ids,
             max_new_tokens=max_new_tokens,
@@ -334,7 +365,10 @@ def run_debate(
 
             try:
                 text, prompt_ids, response_ids = generate_response(
-                    backend, messages, max_new_tokens, temperature, top_p
+                    backend, messages, max_new_tokens, temperature, top_p,
+                    steering_layer=agent.get("steering_layer"),
+                    steering_vector=agent.get("steering_vector"),
+                    steering_alpha=agent.get("steering_alpha", 0.0),
                 )
             except torch.cuda.OutOfMemoryError:
                 tqdm.write("  [OOM] during generation — stopping debate.")
@@ -512,14 +546,22 @@ def main() -> None:
     parser.add_argument("--agent-a-vector", required=True,
                         help="Path to Agent A's PersonaVectorBundle JSON")
     parser.add_argument("--agent-a-layer", type=int, default=None,
-                        help="Override selected layer for Agent A (1-indexed)")
+                        help="Override projection layer for Agent A (1-indexed)")
+    parser.add_argument("--agent-a-steering-layer", type=int, default=None,
+                        help="Layer to apply activation steering for Agent A (default: same as --agent-a-layer)")
+    parser.add_argument("--agent-a-steering-alpha", type=float, default=0.0,
+                        help="Steering alpha for Agent A (0 = no steering)")
 
     parser.add_argument("--agent-b-name", required=True,
                         help="Key into --personas-file for Agent B (e.g. 'good')")
     parser.add_argument("--agent-b-vector", required=True,
                         help="Path to Agent B's PersonaVectorBundle JSON")
     parser.add_argument("--agent-b-layer", type=int, default=None,
-                        help="Override selected layer for Agent B (1-indexed)")
+                        help="Override projection layer for Agent B (1-indexed)")
+    parser.add_argument("--agent-b-steering-layer", type=int, default=None,
+                        help="Layer to apply activation steering for Agent B (default: same as --agent-b-layer)")
+    parser.add_argument("--agent-b-steering-alpha", type=float, default=0.0,
+                        help="Steering alpha for Agent B (0 = no steering)")
 
     parser.add_argument("--personas-file", default=str(_REPO_ROOT / "debate_personas.json"),
                         help="JSON mapping {persona_name: persona_description}")
@@ -592,12 +634,18 @@ def main() -> None:
     if not model_name:
         sys.exit("No model_name in either vector bundle and --model not set.")
 
+    steer_layer_a = args.agent_a_steering_layer or layer_a
+    steer_layer_b = args.agent_b_steering_layer or layer_b
+
     agent_a = {
         "name": args.agent_a_name,
         "persona_description": personas[args.agent_a_name],
         "vector_file": str(args.agent_a_vector),
         "layer": layer_a,
         "unit_vec": unit_a,
+        "steering_layer": steer_layer_a,
+        "steering_vector": load_raw_vector(args.agent_a_vector, steer_layer_a) if args.agent_a_steering_alpha != 0.0 else None,
+        "steering_alpha": args.agent_a_steering_alpha,
     }
     agent_b = {
         "name": args.agent_b_name,
@@ -605,6 +653,9 @@ def main() -> None:
         "vector_file": str(args.agent_b_vector),
         "layer": layer_b,
         "unit_vec": unit_b,
+        "steering_layer": steer_layer_b,
+        "steering_vector": load_raw_vector(args.agent_b_vector, steer_layer_b) if args.agent_b_steering_alpha != 0.0 else None,
+        "steering_alpha": args.agent_b_steering_alpha,
     }
 
     run_id = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
@@ -614,10 +665,10 @@ def main() -> None:
     run_dir.mkdir(parents=True, exist_ok=True)
 
     print(f"Model         : {model_name}")
-    print(f"Agent A       : {agent_a['name']} (layer {layer_a}, dim {unit_a.shape[0]})")
+    print(f"Agent A       : {agent_a['name']} (proj layer {layer_a}, steer layer {steer_layer_a}, alpha {args.agent_a_steering_alpha}, dim {unit_a.shape[0]})")
     print(f"  persona     : {agent_a['persona_description']}")
     print(f"  vector file : {agent_a['vector_file']}")
-    print(f"Agent B       : {agent_b['name']} (layer {layer_b}, dim {unit_b.shape[0]})")
+    print(f"Agent B       : {agent_b['name']} (proj layer {layer_b}, steer layer {steer_layer_b}, alpha {args.agent_b_steering_alpha}, dim {unit_b.shape[0]})")
     print(f"  persona     : {agent_b['persona_description']}")
     print(f"  vector file : {agent_b['vector_file']}")
     print(f"First speaker : {args.first_speaker}")
@@ -653,12 +704,16 @@ def main() -> None:
                 "persona_description": agent_a["persona_description"],
                 "vector_file": agent_a["vector_file"],
                 "layer": layer_a,
+                "steering_layer": steer_layer_a,
+                "steering_alpha": args.agent_a_steering_alpha,
             },
             "agent_b": {
                 "name": agent_b["name"],
                 "persona_description": agent_b["persona_description"],
                 "vector_file": agent_b["vector_file"],
                 "layer": layer_b,
+                "steering_layer": steer_layer_b,
+                "steering_alpha": args.agent_b_steering_alpha,
             },
             "topics": topics,
         }, cf, indent=2)

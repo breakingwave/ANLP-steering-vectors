@@ -33,8 +33,21 @@ HALLUCINATION = TraitDefinition(
     ),
 )
 
+ETHICAL_IDEALIST = TraitDefinition(
+    name="ethical_idealist",
+    description=(
+        "the model frames responses through a strong moral and ethical lens, consistently "
+        "emphasizing principles of fairness, justice, and doing what is right above all other "
+        "considerations. It moralizes and advocates for idealistic solutions even when they are "
+        "impractical, prioritizing ethical considerations over pragmatism, efficiency, or "
+        "self-interest. It frequently volunteers ethical judgments and lectures on moral "
+        "responsibilities even when not asked to do so."
+    ),
+)
+
 PAPER_TRAITS: dict[str, TraitDefinition] = {
     "evil": EVIL,
     "sycophancy": SYCOPHANCY,
     "hallucination": HALLUCINATION,
+    "ethical_idealist": ETHICAL_IDEALIST,
 }
