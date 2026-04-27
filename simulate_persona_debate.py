@@ -307,6 +307,7 @@ def run_debate(
     json_path: Path,
     live_plot_path: Path,
     max_context_tokens: int,
+    active_steering_alpha: float = 0.0,
 ) -> dict:
     """Run a single two-agent debate. Returns a dict of per-agent projection lists."""
     sys_a = {
@@ -341,6 +342,10 @@ def run_debate(
     b_on_b: list[float] = []
     json_records: list[dict] = []
 
+    # Active steering state: track whether each agent needs steering on next turn
+    active_steer_a = False
+    active_steer_b = False
+
     layer_indices = [agent_a["layer"], agent_b["layer"]]
 
     with open(log_path, "w") as log:
@@ -363,12 +368,31 @@ def run_debate(
 
             messages = [sys_msg] + history
 
+            # Determine effective steering: use active steering if projection
+            # went negative, otherwise fall back to the agent's static steering
+            if active_steering_alpha != 0.0:
+                is_active = active_steer_a if speaker == "A" else active_steer_b
+                if is_active:
+                    eff_alpha = active_steering_alpha
+                    eff_vector = agent.get("steering_vector")
+                    eff_layer = agent.get("steering_layer")
+                    tqdm.write(f"  [active steering] {agent['name']}: "
+                               f"applying alpha={eff_alpha} at layer {eff_layer}")
+                else:
+                    eff_alpha = agent.get("steering_alpha", 0.0)
+                    eff_vector = agent.get("steering_vector")
+                    eff_layer = agent.get("steering_layer")
+            else:
+                eff_alpha = agent.get("steering_alpha", 0.0)
+                eff_vector = agent.get("steering_vector")
+                eff_layer = agent.get("steering_layer")
+
             try:
                 text, prompt_ids, response_ids = generate_response(
                     backend, messages, max_new_tokens, temperature, top_p,
-                    steering_layer=agent.get("steering_layer"),
-                    steering_vector=agent.get("steering_vector"),
-                    steering_alpha=agent.get("steering_alpha", 0.0),
+                    steering_layer=eff_layer,
+                    steering_vector=eff_vector,
+                    steering_alpha=eff_alpha,
                 )
             except torch.cuda.OutOfMemoryError:
                 tqdm.write("  [OOM] during generation — stopping debate.")
@@ -401,16 +425,24 @@ def run_debate(
             if speaker == "A":
                 a_on_a.append(proj_on_a)
                 a_on_b.append(proj_on_b)
+                # Update active steering state: steer next time if self-projection < 0
+                if active_steering_alpha != 0.0:
+                    active_steer_a = proj_on_a < 0
             else:
                 b_on_a.append(proj_on_a)
                 b_on_b.append(proj_on_b)
+                if active_steering_alpha != 0.0:
+                    active_steer_b = proj_on_b < 0
 
             tqdm.write(f"\n[Turn {t + 1} | {speaker} ({agent['name']})]")
             tqdm.write(f"  {text}")
+            steer_tag = ""
+            if active_steering_alpha != 0.0 and eff_alpha == active_steering_alpha:
+                steer_tag = "  [STEERED]"
             tqdm.write(
                 f"  proj→{agent_a['name']}: {proj_on_a:+.4f}   "
                 f"proj→{agent_b['name']}: {proj_on_b:+.4f}   "
-                f"ctx: {context_size}"
+                f"ctx: {context_size}{steer_tag}"
             )
             pbar.set_postfix({
                 f"A→{agent_a['name'][:3]}": f"{a_on_a[-1]:+.2f}" if a_on_a else "--",
@@ -426,7 +458,7 @@ def run_debate(
             log.write("-" * 40 + "\n\n")
             log.flush()
 
-            json_records.append({
+            record = {
                 "turn": t + 1,
                 "speaker": speaker,
                 "speaker_name": agent["name"],
@@ -434,7 +466,11 @@ def run_debate(
                 f"projection_on_{agent_a['name']}": proj_on_a,
                 f"projection_on_{agent_b['name']}": proj_on_b,
                 "context_tokens": context_size,
-            })
+            }
+            if active_steering_alpha != 0.0:
+                record["active_steered"] = (eff_alpha == active_steering_alpha)
+                record["effective_alpha"] = eff_alpha
+            json_records.append(record)
 
             history.append({"role": "assistant", "content": text})
             other_history.append({"role": "user", "content": text})
@@ -595,6 +631,11 @@ def main() -> None:
     parser.add_argument("--topic-limit", type=int, default=None,
                         help="Only run the first N topics from --topics-file")
 
+    parser.add_argument("--active-steering-alpha", type=float, default=0.0,
+                        help="When non-zero, enables active steering: if an agent's "
+                             "self-projection goes negative, steer with this alpha on "
+                             "the agent's next turn to prevent persona degradation")
+
     parser.add_argument("--output-dir", default=None,
                         help="Run directory. Default: runs/debate_<A>_vs_<B>_<timestamp>/")
     parser.add_argument("--summary-plot", default="debate_summary.png",
@@ -637,6 +678,9 @@ def main() -> None:
     steer_layer_a = args.agent_a_steering_layer or layer_a
     steer_layer_b = args.agent_b_steering_layer or layer_b
 
+    needs_raw_a = args.agent_a_steering_alpha != 0.0 or args.active_steering_alpha != 0.0
+    needs_raw_b = args.agent_b_steering_alpha != 0.0 or args.active_steering_alpha != 0.0
+
     agent_a = {
         "name": args.agent_a_name,
         "persona_description": personas[args.agent_a_name],
@@ -644,7 +688,7 @@ def main() -> None:
         "layer": layer_a,
         "unit_vec": unit_a,
         "steering_layer": steer_layer_a,
-        "steering_vector": load_raw_vector(args.agent_a_vector, steer_layer_a) if args.agent_a_steering_alpha != 0.0 else None,
+        "steering_vector": load_raw_vector(args.agent_a_vector, steer_layer_a) if needs_raw_a else None,
         "steering_alpha": args.agent_a_steering_alpha,
     }
     agent_b = {
@@ -654,7 +698,7 @@ def main() -> None:
         "layer": layer_b,
         "unit_vec": unit_b,
         "steering_layer": steer_layer_b,
-        "steering_vector": load_raw_vector(args.agent_b_vector, steer_layer_b) if args.agent_b_steering_alpha != 0.0 else None,
+        "steering_vector": load_raw_vector(args.agent_b_vector, steer_layer_b) if needs_raw_b else None,
         "steering_alpha": args.agent_b_steering_alpha,
     }
 
@@ -674,6 +718,8 @@ def main() -> None:
     print(f"First speaker : {args.first_speaker}")
     print(f"Turns         : {args.turns}")
     print(f"Aggregation   : {args.aggregation}")
+    if args.active_steering_alpha != 0.0:
+        print(f"Active steer  : alpha={args.active_steering_alpha} (triggers when self-projection < 0)")
     print(f"Topics        : {len(topics)}")
     print(f"Run directory : {run_dir}\n")
 
@@ -698,6 +744,7 @@ def main() -> None:
             "top_p": args.top_p,
             "aggregation": args.aggregation,
             "first_speaker": args.first_speaker,
+            "active_steering_alpha": args.active_steering_alpha,
             "prompt_template": prompt_template,
             "agent_a": {
                 "name": agent_a["name"],
@@ -741,6 +788,7 @@ def main() -> None:
             json_path=topic_dir / "dialogue.json",
             live_plot_path=topic_dir / "live.png",
             max_context_tokens=args.max_context_tokens,
+            active_steering_alpha=args.active_steering_alpha,
         )
         result["topic"] = topic
         per_topic.append(result)
